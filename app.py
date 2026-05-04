@@ -15,7 +15,7 @@ from codeflow.analyzer import analyze_paths, generate_mermaid
 
 
 HOST = "127.0.0.1"
-PORT = 8002
+PORT = 8009
 
 
 def render_page(report: dict[str, Any] | None = None, error: str | None = None) -> str:
@@ -575,6 +575,32 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
     .json-null {{ color: var(--muted); }}
     .error-block .json-string {{ color: var(--error); }}
     .success-block .json-string {{ color: var(--success); }}
+    .curl-block {{ color: #c8a4ff; }}
+    .auth-badge {{
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 10px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .auth-header {{
+      display: block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-top: 2px;
+      word-break: break-all;
+    }}
+    .auth-classes {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }}
+    .auth-pill {{
+      font-size: 0.7rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.12);
+      color: var(--muted);
+    }}
     .pulse-icon {{
       font-size: 2rem;
       animation: pulse 2s infinite;
@@ -1001,7 +1027,7 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
 
     function syntaxHighlight(json) {{
       return json
-        .replace(/("(\\u[a-zA-Z0-9]{{4}}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, match => {{
+        .replace(/("(\\u[a-zA-Z0-9]{{4}}|\\[^u]|[^\\"])*"(\\s*:)?|\\b(true|false|null)\\b|-?\\d+(?:\\.\\d*)?(?:[eE][+\\-]?\\d+)?)/g, match => {{
           let cls = 'json-number';
           if (/^"/.test(match)) {{
             cls = /:$/.test(match) ? 'json-key' : 'json-string';
@@ -1021,27 +1047,94 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
       return obj;
     }}
 
-    function showApiSpec(spec) {{
-      const panel = document.getElementById('apiSpecPanel');
+    function resolveAuth(spec) {{
+      const perms = spec.permission_classes || [];
+      const auth  = spec.auth_classes || [];
+      const all   = [...perms, ...auth].map(s => s.toLowerCase());
+      if (all.some(s => s.includes('allowany')))         return {{ label: 'No Auth Required', icon: '🔓', color: 'var(--muted)', header: null }};
+      if (all.some(s => s.includes('isadmin')))          return {{ label: 'Admin Token Required', icon: '🔒', color: 'var(--error)', header: 'Authorization: Bearer <admin-token>' }};
+      if (all.some(s => s.includes('jwt') || s.includes('simplejwt'))) return {{ label: 'JWT Bearer Token', icon: '🔑', color: '#f0c050', header: 'Authorization: Bearer <jwt-token>' }};
+      if (all.some(s => s.includes('sessionauth')))      return {{ label: 'Session Auth', icon: '🍪', color: '#f0c050', header: 'Cookie: sessionid=<session-id>' }};
+      if (all.some(s => s.includes('tokenauthentication'))) return {{ label: 'DRF Token Auth', icon: '🔑', color: '#f0c050', header: 'Authorization: Token <your-token>' }};
+      if (all.some(s => s.includes('isauthentic') || s.includes('login_required'))) return {{ label: 'Authentication Required', icon: '🔒', color: '#f0c050', header: 'Authorization: Bearer <token>' }};
+      if (perms.length > 0) return {{ label: perms.join(', '), icon: '🔒', color: '#f0c050', header: 'Authorization: Bearer <token>' }};
+      return {{ label: 'Unknown — check permission_classes', icon: '⚠️', color: 'var(--muted)', header: 'Authorization: Bearer <token>' }};
+    }}
 
-      const payloadObj = buildPayloadJson(spec.payload);
+    function buildCurl(spec, authInfo) {{
+      const NL = String.fromCharCode(10);
+      // Extract HTTP method from label (e.g. "GET material (list)" → "GET")
+      const methodMatch = spec.label.match(/^([A-Z]+)/);
+      const method = methodMatch ? methodMatch[1] : 'GET';
+      // Try to extract real URL path from context (e.g. path('material/', ...) → /material/)
+      let urlPath = '/api/your-endpoint/';
+      if (spec.context) {{
+        const ctxMatch = spec.context.match(/path\\s*\\(\\s*['"]([^'"]+)['"]/);
+        if (ctxMatch) urlPath = '/' + ctxMatch[1];
+      }}
+      const lines = ['curl -X ' + method + ' "https://your-api.server' + urlPath + '"'];
+      if (authInfo.header) lines.push('  -H "' + authInfo.header + '"');
+      lines.push('  -H "Content-Type: application/json"');
+      if (spec.payload && spec.payload.length && !['GET', 'DELETE'].includes(method)) {{
+        const body = {{}};
+        spec.payload.forEach(f => {{ body[f] = ''; }});
+        const bodyStr = JSON.stringify(body, null, 2).split(NL).join(NL + '       ');
+        lines.push("  -d '" + bodyStr + "'");
+      }}
+      return lines.join(' \\\\' + NL);
+    }}
+
+    function showApiSpec(spec) {{
+      const panel   = document.getElementById('apiSpecPanel');
+      const authInfo = resolveAuth(spec);
+
+      // Build payload JSON object
+      const payloadObj  = buildPayloadJson(spec.payload);
       const payloadJson = JSON.stringify(payloadObj, null, 2);
 
-      const exceptionsArr = spec.exceptions && spec.exceptions.length
-        ? spec.exceptions
-        : ["No explicit exceptions raised in view."];
-      const exceptionsJson = JSON.stringify(exceptionsArr, null, 2);
-
+      // Success response — flat shape matching real API: {{ status, data, message }}
       const successArr = Array.isArray(spec.success) && spec.success.length
-        ? spec.success
-        : (spec.success ? [spec.success] : ["Returns standard 200/201 Response"]);
-      const successJson = JSON.stringify(successArr, null, 2);
+        ? spec.success : (spec.success ? [spec.success] : ['HTTP 200 OK']);
+      const firstSuccess = successArr[0] || 'HTTP 200 OK';
+      const sm = firstSuccess.match(/HTTP\\s+(\\d{{3}})/);
+      const successCode = sm ? parseInt(sm[1]) : 200;
+      const successMsg  = firstSuccess.replace(/^HTTP\\s+\\d{{3}}\\s*[—-]?\\s*/, '').replace(/^["']|["']$/g, '').trim() || 'Success';
+      const successResp = {{ status: successCode, data: {{}}, message: successMsg }};
+
+      // Error responses — flat array of {{ status, message }}
+      const errList = [];
+      (spec.exceptions || []).forEach(e => {{
+        const em = e.match(/HTTP\\s+(\\d{{3}})/);
+        if (em) {{
+          const code = parseInt(em[1]);
+          const msg  = e.replace(/^HTTP\\s+\\d{{3}}\\s*[—-]?\\s*/, '').replace(/^["']|["']$/g, '').trim() || 'Error';
+          if (!errList.find(x => x.status === code && x.message === msg))
+            errList.push({{ status: code, message: msg }});
+        }} else if (!e.startsWith('HTTP')) {{
+          errList.push({{ status: 400, error: e }});
+        }}
+      }});
+      const errResp = errList.length === 1 ? errList[0] : (errList.length ? errList : {{ message: 'No error returns detected' }});
+
+      const curlCmd = buildCurl(spec, authInfo);
 
       panel.innerHTML = `
         <div class="spec-header">
-          <div>
-            <h2 class="spec-title">Spec: ${{spec.label}}</h2>
-            <p class="spec-source">Source: ${{spec.file}}</p>
+          <h2 class="spec-title">${{spec.label}}</h2>
+          <p class="spec-source">
+            ${{spec.serializer ? `<span style="color:var(--primary);margin-right:10px;">⬡ ${{spec.serializer}}</span>` : ''}}
+            ${{spec.file}}
+          </p>
+        </div>
+
+        <div class="spec-section">
+          <div class="spec-block-head">
+            <span class="spec-label" style="color:${{authInfo.color}};">${{authInfo.icon}} AUTHENTICATION</span>
+          </div>
+          <div class="auth-badge" style="border-color:${{authInfo.color}}20; background:${{authInfo.color}}0d;">
+            <span style="color:${{authInfo.color}}; font-weight:700;">${{authInfo.label}}</span>
+            ${{authInfo.header ? `<code class="auth-header">${{authInfo.header}}</code>` : ''}}
+            ${{(spec.permission_classes||[]).length ? `<div class="auth-classes">${{(spec.permission_classes||[]).map(p=>`<span class="auth-pill">${{p}}</span>`).join('')}}</div>` : ''}}
           </div>
         </div>
 
@@ -1055,16 +1148,40 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
 
         <div class="spec-section">
           <div class="spec-block-head">
-            <span class="spec-label error-label">POSSIBLE EXCEPTIONS</span>
+            <span class="spec-label" style="color:#c8a4ff;">CURL EXAMPLE</span>
+            <button class="spec-copy-btn" onclick="copySpecBlock('curl-block', this)">Copy</button>
           </div>
-          <div class="json-block error-block">${{syntaxHighlight(exceptionsJson)}}</div>
+          <div class="json-block curl-block" id="curl-block" style="border-color:rgba(200,164,255,0.2); color:#c8a4ff; white-space:pre;">${{curlCmd}}</div>
+        </div>
+
+        ${{(spec.db_ops||[]).length ? `
+        <div class="spec-section">
+          <div class="spec-block-head">
+            <span class="spec-label" style="color:#62ddff;">DATABASE OPS</span>
+          </div>
+          <div class="json-block" style="border-color:rgba(98,221,255,0.2);">${{syntaxHighlight(JSON.stringify(spec.db_ops, null, 2))}}</div>
+        </div>` : ''}}
+
+        ${{(spec.outbound_calls||[]).length ? `
+        <div class="spec-section">
+          <div class="spec-block-head">
+            <span class="spec-label" style="color:#ffd166;">OUTBOUND CALLS</span>
+          </div>
+          <div class="json-block" style="border-color:rgba(255,209,102,0.2);">${{syntaxHighlight(JSON.stringify(spec.outbound_calls, null, 2))}}</div>
+        </div>` : ''}}
+
+        <div class="spec-section">
+          <div class="spec-block-head">
+            <span class="spec-label success-label">SUCCESS RESPONSE</span>
+          </div>
+          <div class="json-block success-block">${{syntaxHighlight(JSON.stringify(successResp, null, 2))}}</div>
         </div>
 
         <div class="spec-section">
           <div class="spec-block-head">
-            <span class="spec-label success-label">SUCCESS FLOW</span>
+            <span class="spec-label error-label">ERROR RESPONSES</span>
           </div>
-          <div class="json-block success-block">${{syntaxHighlight(successJson)}}</div>
+          <div class="json-block error-block">${{syntaxHighlight(JSON.stringify(errResp, null, 2))}}</div>
         </div>
       `;
     }}
@@ -1229,17 +1346,23 @@ def render_api_row(api: dict[str, Any]) -> str:
     models = render_pills(api.get("models", []), "None")
     app_tag = f'<span class="pill" style="background:var(--primary-soft);">{html.escape(api.get("app", "root"))}</span>'
     
-    # Prepare details for JS
-    spec = json.dumps({
+    # Store spec in a data attribute (html.escape handles quotes/angle-brackets safely)
+    spec_escaped = html.escape(json.dumps({
         "label": api["label"],
         "payload": api.get("payload", []),
         "exceptions": api.get("exceptions", []),
         "success": api.get("success_paths", ["Returns standard 200/201 Response"]),
-        "file": shorten_path(api["file"])
-    })
-    
+        "file": shorten_path(api["file"]),
+        "context": api.get("context", ""),
+        "permission_classes": api.get("permission_classes", []),
+        "auth_classes": api.get("auth_classes", []),
+        "db_ops": api.get("db_ops", []),
+        "outbound_calls": api.get("outbound_calls", []),
+        "serializer": api.get("serializer_class") or "",
+    }), quote=True)
+
     return f"""
-    <tr class="api-row" onclick='showApiSpec({spec})'>
+    <tr class="api-row" onclick="showApiSpec(JSON.parse(this.dataset.spec))" data-spec="{spec_escaped}">
       <td>{app_tag}</td>
       <td><code class="api-route">{html.escape(api["label"])}</code></td>
       <td>{checks}</td>

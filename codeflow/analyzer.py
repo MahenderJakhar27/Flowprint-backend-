@@ -110,6 +110,11 @@ class ApiPoint:
     app: str = "root"
     view_name: str | None = None
     action: str | None = None
+    permission_classes: list[str] = field(default_factory=list)
+    auth_classes: list[str] = field(default_factory=list)
+    db_ops: list[str] = field(default_factory=list)
+    outbound_calls: list[str] = field(default_factory=list)
+    serializer_class: str | None = None
 
 
 @dataclass
@@ -171,6 +176,8 @@ class FunctionFlow:
     ordered_steps: list[dict] = field(default_factory=list)
     payload_fields: list[str] = field(default_factory=list)
     exceptions: list[str] = field(default_factory=list)
+    permission_classes: list[str] = field(default_factory=list)
+    auth_classes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -289,6 +296,19 @@ def analyze_paths(paths: Iterable[Path]) -> AnalysisReport:
             if match:
                 api.payload = sorted(list(set(api.payload + match.payload_fields)))
                 api.exceptions = sorted(list(set(api.exceptions + match.exceptions)))
+                # Auth / permissions
+                if not api.permission_classes:
+                    api.permission_classes = match.permission_classes
+                if not api.auth_classes:
+                    api.auth_classes = match.auth_classes
+                # Serializer
+                if not api.serializer_class:
+                    api.serializer_class = match.serializer_class
+                # DB ops — deduplicated labels
+                db_labels = [f"{d['operation']} {d['table']}" for d in match.database_tables]
+                api.db_ops = sorted(list(set(db_labels)))[:8]
+                # Outbound calls
+                api.outbound_calls = sorted(list({d.get("label", "") for d in match.outbound_apis if d.get("label")}))[:6]
                 if not api.success_paths:
                     # Prefer explicit HTTP 2xx return messages; fall back to callee if this
                     # function only delegates (e.g. return cls.create_or_update(...))
@@ -672,6 +692,8 @@ def analyze_python_functions(path: Path, content: str, lines: list[str]) -> list
 
         class_serializer: str | None = None
         class_payload: list[str] = []
+        class_permissions: list[str] = []
+        class_auth: list[str] = []
         for stmt in class_node.body:
             if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
                 continue
@@ -688,6 +710,18 @@ def analyze_python_functions(path: Path, content: str, lines: list[str]) -> list
                     for elt in stmt.value.elts:
                         if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                             class_payload.append(elt.value)
+            elif target.id == "permission_classes":
+                if isinstance(stmt.value, (ast.List, ast.Tuple)):
+                    for elt in stmt.value.elts:
+                        name = elt.id if isinstance(elt, ast.Name) else (elt.attr if isinstance(elt, ast.Attribute) else None)
+                        if name:
+                            class_permissions.append(name)
+            elif target.id == "authentication_classes":
+                if isinstance(stmt.value, (ast.List, ast.Tuple)):
+                    for elt in stmt.value.elts:
+                        name = elt.id if isinstance(elt, ast.Name) else (elt.attr if isinstance(elt, ast.Attribute) else None)
+                        if name:
+                            class_auth.append(name)
 
         class_source = ast.get_source_segment(content, class_node) or ""
         class_partners = sorted(extract_partners(class_source))
@@ -729,6 +763,28 @@ def analyze_python_functions(path: Path, content: str, lines: list[str]) -> list
             if not routes and is_view:
                 routes = [f"{method.name.upper()} (Action)"]
 
+            # Method-level permission/auth decorators override class-level
+            method_permissions = list(class_permissions)
+            method_auth = list(class_auth)
+            for dec in method.decorator_list:
+                dec_code = ast.unparse(dec)
+                if "permission_classes" in dec_code and isinstance(dec, ast.Call) and dec.args:
+                    arg = dec.args[0]
+                    if isinstance(arg, (ast.List, ast.Tuple)):
+                        method_permissions = []
+                        for elt in arg.elts:
+                            name = elt.id if isinstance(elt, ast.Name) else (elt.attr if isinstance(elt, ast.Attribute) else None)
+                            if name:
+                                method_permissions.append(name)
+                if "authentication_classes" in dec_code and isinstance(dec, ast.Call) and dec.args:
+                    arg = dec.args[0]
+                    if isinstance(arg, (ast.List, ast.Tuple)):
+                        method_auth = []
+                        for elt in arg.elts:
+                            name = elt.id if isinstance(elt, ast.Name) else (elt.attr if isinstance(elt, ast.Attribute) else None)
+                            if name:
+                                method_auth.append(name)
+
             outbound = [asdict(a) for a in extract_api_points(local_lines, path, "outbound", partners, line_offset=start - 1)]
             database = [asdict(d) for d in extract_database_points(local_lines, path, partners, line_offset=start - 1)]
             database += [asdict(d) for d in extract_django_orm(local_lines, path, set(partners), line_offset=start - 1)]
@@ -759,9 +815,11 @@ def analyze_python_functions(path: Path, content: str, lines: list[str]) -> list
                 ordered_steps=ordered_steps[:24],
                 is_generic=is_view,
                 class_name=class_node.name,
-                serializer_class=method_serializer,
+                serializer_class=method_serializer or class_serializer,
                 payload_fields=sorted(list(set(payload_fields))),
                 exceptions=sorted(list(set(exceptions))),
+                permission_classes=method_permissions,
+                auth_classes=method_auth,
             ))
 
     # --- Pass 2: standalone functions (FBVs) ---
@@ -779,13 +837,37 @@ def analyze_python_functions(path: Path, content: str, lines: list[str]) -> list
         partners = sorted(extract_partners(source))
         checks = sorted(extract_checks(source))
         routes = extract_routes_from_decorators(node)
+
+        # FBV decorator-level permission/auth detection
+        fbv_permissions: list[str] = []
+        fbv_auth: list[str] = []
+        for dec in node.decorator_list:
+            dec_code = ast.unparse(dec)
+            if "permission_classes" in dec_code and isinstance(dec, ast.Call) and dec.args:
+                arg = dec.args[0]
+                if isinstance(arg, (ast.List, ast.Tuple)):
+                    for elt in arg.elts:
+                        name = elt.id if isinstance(elt, ast.Name) else (elt.attr if isinstance(elt, ast.Attribute) else None)
+                        if name:
+                            fbv_permissions.append(name)
+            if "authentication_classes" in dec_code and isinstance(dec, ast.Call) and dec.args:
+                arg = dec.args[0]
+                if isinstance(arg, (ast.List, ast.Tuple)):
+                    for elt in arg.elts:
+                        name = elt.id if isinstance(elt, ast.Name) else (elt.attr if isinstance(elt, ast.Attribute) else None)
+                        if name:
+                            fbv_auth.append(name)
+            # @login_required → IsAuthenticated equivalent
+            if dec_code.strip() in ("login_required", "staff_member_required"):
+                fbv_permissions.append(dec_code.strip())
+
         outbound = [asdict(a) for a in extract_api_points(local_lines, path, "outbound", partners, line_offset=start - 1)]
         database = [asdict(d) for d in extract_database_points(local_lines, path, partners, line_offset=start - 1)]
         database += [asdict(d) for d in extract_django_orm(local_lines, path, set(partners), line_offset=start - 1)]
         decision_points = collect_python_decisions(node, content, path, partners, checks)
         returns = collect_python_returns(node, content)
 
-        payload_fields, exceptions, _, internal_calls = _scan_body(node, None)
+        payload_fields, exceptions, fbv_serializer, internal_calls = _scan_body(node, None)
 
         ordered_steps = build_ordered_steps(routes, decision_points, database, outbound, returns, start)
         summary = build_function_summary(node.name, routes, checks, database, outbound, returns, decision_points, False)
@@ -807,9 +889,11 @@ def analyze_python_functions(path: Path, content: str, lines: list[str]) -> list
             ordered_steps=ordered_steps[:24],
             is_generic=False,
             class_name=None,
-            serializer_class=None,
+            serializer_class=fbv_serializer,
             payload_fields=sorted(list(set(payload_fields))),
             exceptions=sorted(list(set(exceptions))),
+            permission_classes=fbv_permissions,
+            auth_classes=fbv_auth,
         ))
 
     return sorted(functions, key=lambda item: item.line)
