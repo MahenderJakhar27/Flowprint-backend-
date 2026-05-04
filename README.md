@@ -140,6 +140,3 @@ python -m unittest tests/test_analyzer.py -v
 
 ---
 
-## License
-
-MIT
