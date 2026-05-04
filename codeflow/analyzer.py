@@ -283,6 +283,12 @@ def analyze_paths(paths: Iterable[Path]) -> AnalysisReport:
                         # Bubble auth_decorator up — handler knows the permission key, ViewSet delegates to it
                         if not func.auth_decorator and target.auth_decorator:
                             func.auth_decorator = target.auth_decorator
+                        # Bubble database_tables up so ViewSet methods inherit ORM calls from helpers
+                        existing_db = {(d["operation"], d["table"]) for d in func.database_tables}
+                        for d in target.database_tables:
+                            if (d["operation"], d["table"]) not in existing_db:
+                                func.database_tables.append(d)
+                                existing_db.add((d["operation"], d["table"]))
                         # Bubble HTTP 2xx/201 returns up through the call chain
                         target_http = [r for r in target.returns if re.search(r"HTTP [12]\d{2}", r["summary"])]
                         if target_http:
@@ -547,9 +553,7 @@ def analyze_file(path: Path) -> FileReport | None:
         database_tables = merge_database_points(database_tables, functions)
         flow_points = merge_flow_points(flow_points, functions)
 
-    serializers = []
-    if "serializers.py" in str(path) or "serializers/" in str(path):
-        serializers = analyze_serializers(path, content)
+    serializers = analyze_serializers(path, content)
         
     return FileReport(
         path=str(path),
@@ -1463,7 +1467,9 @@ def build_file_summary(
 
 def analyze_django_models(path: Path, content: str) -> list[ModelSchema]:
     try:
-        tree = ast.parse(content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(content)
     except SyntaxError:
         return []
     
@@ -1510,7 +1516,9 @@ def analyze_django_models(path: Path, content: str) -> list[ModelSchema]:
 
 def analyze_serializers(path: Path, content: str) -> list[SerializerSchema]:
     try:
-        tree = ast.parse(content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(content)
     except SyntaxError:
         return []
     

@@ -15,7 +15,7 @@ from codeflow.analyzer import analyze_paths, generate_mermaid
 
 
 HOST = "127.0.0.1"
-PORT = 8000
+PORT = 8012
 
 
 def render_page(report: dict[str, Any] | None = None, error: str | None = None) -> str:
@@ -488,6 +488,7 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
     }}
     .api-row {{ cursor: pointer; transition: background 0.2s; }}
     .api-row:hover {{ background: rgba(98, 221, 255, 0.05); }}
+    .api-row.selected {{ background: rgba(98, 221, 255, 0.13); border-left: 3px solid var(--accent); }}
     .api-spec-pane {{
       position: sticky;
       top: 20px;
@@ -1118,7 +1119,9 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
       return lines.join(' \\\\' + NL);
     }}
 
-    function showApiSpec(spec) {{
+    function showApiSpec(spec, rowEl) {{
+      document.querySelectorAll('.api-row.selected').forEach(r => r.classList.remove('selected'));
+      if (rowEl) rowEl.classList.add('selected');
       const panel   = document.getElementById('apiSpecPanel');
       const authInfo = resolveAuth(spec);
 
@@ -1189,13 +1192,6 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
           <div class="json-block curl-block" id="curl-block" style="border-color:rgba(200,164,255,0.2); color:#c8a4ff; white-space:pre;">${{curlCmd}}</div>
         </div>
 
-        ${{(spec.db_ops||[]).length ? `
-        <div class="spec-section">
-          <div class="spec-block-head">
-            <span class="spec-label" style="color:#62ddff;">DATABASE OPS</span>
-          </div>
-          <div class="json-block" style="border-color:rgba(98,221,255,0.2);">${{syntaxHighlight(JSON.stringify(spec.db_ops, null, 2))}}</div>
-        </div>` : ''}}
 
         ${{(spec.outbound_calls||[]).length ? `
         <div class="spec-section">
@@ -1378,7 +1374,9 @@ def render_diagnostic_row(d: dict[str, Any]) -> str:
 
 def render_api_row(api: dict[str, Any]) -> str:
     checks = render_pills(api.get("checks", []), "None")
-    models = render_pills(api.get("models", []), "None")
+    # Extract unique model names from db_ops e.g. "create BomType" → "BomType"
+    model_names = sorted({op.split(" ", 1)[1] for op in api.get("db_ops", []) if " " in op})
+    models = render_pills(model_names, "None")
     app_tag = f'<span class="pill" style="background:var(--primary-soft);">{html.escape(api.get("app", "root"))}</span>'
     
     # Store spec in a data attribute (html.escape handles quotes/angle-brackets safely)
@@ -1398,7 +1396,7 @@ def render_api_row(api: dict[str, Any]) -> str:
     }), quote=True)
 
     return f"""
-    <tr class="api-row" onclick="showApiSpec(JSON.parse(this.dataset.spec))" data-spec="{spec_escaped}">
+    <tr class="api-row" onclick="showApiSpec(JSON.parse(this.dataset.spec), this)" data-spec="{spec_escaped}">
       <td>{app_tag}</td>
       <td><code class="api-route">{html.escape(api["label"])}</code></td>
       <td>{checks}</td>
