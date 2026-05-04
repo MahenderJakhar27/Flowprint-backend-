@@ -115,6 +115,7 @@ class ApiPoint:
     db_ops: list[str] = field(default_factory=list)
     outbound_calls: list[str] = field(default_factory=list)
     serializer_class: str | None = None
+    auth_decorator: str | None = None  # e.g. @authorize('submit_bomtype') → 'submit_bomtype'
 
 
 @dataclass
@@ -178,6 +179,7 @@ class FunctionFlow:
     exceptions: list[str] = field(default_factory=list)
     permission_classes: list[str] = field(default_factory=list)
     auth_classes: list[str] = field(default_factory=list)
+    auth_decorator: str | None = None  # e.g. @authorize('submit_bomtype') → 'submit_bomtype'
 
 
 @dataclass
@@ -278,6 +280,9 @@ def analyze_paths(paths: Iterable[Path]) -> AnalysisReport:
                     if target:
                         func.payload_fields = sorted(list(set(func.payload_fields + target.payload_fields)))
                         func.exceptions = sorted(list(set(func.exceptions + target.exceptions)))
+                        # Bubble auth_decorator up — handler knows the permission key, ViewSet delegates to it
+                        if not func.auth_decorator and target.auth_decorator:
+                            func.auth_decorator = target.auth_decorator
                         # Bubble HTTP 2xx/201 returns up through the call chain
                         target_http = [r for r in target.returns if re.search(r"HTTP [12]\d{2}", r["summary"])]
                         if target_http:
@@ -309,6 +314,9 @@ def analyze_paths(paths: Iterable[Path]) -> AnalysisReport:
                 api.db_ops = sorted(list(set(db_labels)))[:8]
                 # Outbound calls
                 api.outbound_calls = sorted(list({d.get("label", "") for d in match.outbound_apis if d.get("label")}))[:6]
+                # Custom authorize decorator
+                if not api.auth_decorator and match.auth_decorator:
+                    api.auth_decorator = match.auth_decorator
                 if not api.success_paths:
                     # Prefer explicit HTTP 2xx return messages; fall back to callee if this
                     # function only delegates (e.g. return cls.create_or_update(...))
@@ -570,6 +578,25 @@ def analyze_python_functions(path: Path, content: str, lines: list[str]) -> list
     functions: list[FunctionFlow] = []
     method_ids: set[int] = set()
 
+    def _extract_auth_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+        """Return the first @authorize('key') / @login_required / @permission_required('key') value found."""
+        for dec in node.decorator_list:
+            # @authorize('submit_bomtype') or @require_permission('key')
+            if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name):
+                fname = dec.func.id
+                if fname in ("authorize", "require_permission", "permission_required", "auth_required"):
+                    if dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str):
+                        return dec.args[0].value
+            # @authorize on an attribute: e.g. @Auth.authorize('key')
+            if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute):
+                if dec.func.attr in ("authorize", "require_permission", "auth_required"):
+                    if dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str):
+                        return dec.args[0].value
+            # bare @login_required / @staff_member_required (no key, just flag)
+            if isinstance(dec, ast.Name) and dec.id in ("login_required", "staff_member_required"):
+                return dec.id
+        return None
+
     CBV_BASES = {
         "APIView", "GenericAPIView", "View", "ModelViewSet", "ViewSet",
         "ReadOnlyModelViewSet", "ListAPIView", "CreateAPIView", "RetrieveAPIView",
@@ -820,6 +847,7 @@ def analyze_python_functions(path: Path, content: str, lines: list[str]) -> list
                 exceptions=sorted(list(set(exceptions))),
                 permission_classes=method_permissions,
                 auth_classes=method_auth,
+                auth_decorator=_extract_auth_decorator(method),
             ))
 
     # --- Pass 2: standalone functions (FBVs) ---
@@ -894,6 +922,7 @@ def analyze_python_functions(path: Path, content: str, lines: list[str]) -> list
             exceptions=sorted(list(set(exceptions))),
             permission_classes=fbv_permissions,
             auth_classes=fbv_auth,
+            auth_decorator=_extract_auth_decorator(node),
         ))
 
     return sorted(functions, key=lambda item: item.line)

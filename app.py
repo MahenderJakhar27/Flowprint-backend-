@@ -15,7 +15,7 @@ from codeflow.analyzer import analyze_paths, generate_mermaid
 
 
 HOST = "127.0.0.1"
-PORT = 8009
+PORT = 8000
 
 
 def render_page(report: dict[str, Any] | None = None, error: str | None = None) -> str:
@@ -1048,37 +1048,71 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
     }}
 
     function resolveAuth(spec) {{
+      // @authorize('key') is the most specific signal — check first
+      if (spec.auth_decorator && spec.auth_decorator !== 'login_required' && spec.auth_decorator !== 'staff_member_required') {{
+        return {{
+          label: '@authorize',
+          key: spec.auth_decorator,
+          icon: '🔑',
+          color: '#62ddff',
+          header: 'Authorization: Token <your-token>',
+        }};
+      }}
+
       const perms = spec.permission_classes || [];
       const auth  = spec.auth_classes || [];
       const all   = [...perms, ...auth].map(s => s.toLowerCase());
-      if (all.some(s => s.includes('allowany')))         return {{ label: 'No Auth Required', icon: '🔓', color: 'var(--muted)', header: null }};
-      if (all.some(s => s.includes('isadmin')))          return {{ label: 'Admin Token Required', icon: '🔒', color: 'var(--error)', header: 'Authorization: Bearer <admin-token>' }};
+      if (all.some(s => s.includes('allowany')))            return {{ label: 'No Auth Required',     icon: '🔓', color: 'var(--muted)', header: null }};
+      if (all.some(s => s.includes('isadmin')))             return {{ label: 'Admin Token Required',  icon: '🔒', color: 'var(--error)', header: 'Authorization: Bearer <admin-token>' }};
       if (all.some(s => s.includes('jwt') || s.includes('simplejwt'))) return {{ label: 'JWT Bearer Token', icon: '🔑', color: '#f0c050', header: 'Authorization: Bearer <jwt-token>' }};
-      if (all.some(s => s.includes('sessionauth')))      return {{ label: 'Session Auth', icon: '🍪', color: '#f0c050', header: 'Cookie: sessionid=<session-id>' }};
-      if (all.some(s => s.includes('tokenauthentication'))) return {{ label: 'DRF Token Auth', icon: '🔑', color: '#f0c050', header: 'Authorization: Token <your-token>' }};
+      if (all.some(s => s.includes('sessionauth')))         return {{ label: 'Session Auth',          icon: '🍪', color: '#f0c050', header: 'Cookie: sessionid=<session-id>' }};
+      if (all.some(s => s.includes('tokenauthentication'))) return {{ label: 'DRF Token Auth',        icon: '🔑', color: '#f0c050', header: 'Authorization: Token <your-token>' }};
       if (all.some(s => s.includes('isauthentic') || s.includes('login_required'))) return {{ label: 'Authentication Required', icon: '🔒', color: '#f0c050', header: 'Authorization: Bearer <token>' }};
+      if (spec.auth_decorator === 'login_required')         return {{ label: '@login_required',       icon: '🔒', color: '#f0c050', header: 'Authorization: Bearer <token>' }};
+      if (spec.auth_decorator === 'staff_member_required')  return {{ label: '@staff_member_required',icon: '🔒', color: 'var(--error)', header: 'Authorization: Bearer <admin-token>' }};
       if (perms.length > 0) return {{ label: perms.join(', '), icon: '🔒', color: '#f0c050', header: 'Authorization: Bearer <token>' }};
       return {{ label: 'Unknown — check permission_classes', icon: '⚠️', color: 'var(--muted)', header: 'Authorization: Bearer <token>' }};
     }}
 
+    // Escape HTML so angle-bracket placeholders like <id> survive innerHTML rendering
+    function escHtml(s) {{
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }}
+
     function buildCurl(spec, authInfo) {{
       const NL = String.fromCharCode(10);
-      // Extract HTTP method from label (e.g. "GET material (list)" → "GET")
+      const DETAIL_ACTIONS = ['retrieve', 'update', 'partial_update', 'destroy'];
+
+      // Extract method from label: "GET type (list)" → "GET"
       const methodMatch = spec.label.match(/^([A-Z]+)/);
       const method = methodMatch ? methodMatch[1] : 'GET';
-      // Try to extract real URL path from context (e.g. path('material/', ...) → /material/)
-      let urlPath = '/api/your-endpoint/';
-      if (spec.context) {{
+
+      // Build URL path from label pattern "METHOD prefix (action)"
+      let urlPath = null;
+      const labelMatch = spec.label.match(/^[A-Z\\/]+\\s+([^\\s(]+)\\s+\\(([^)]+)\\)/);
+      if (labelMatch) {{
+        const prefix = labelMatch[1];
+        const action = labelMatch[2];
+        const isDetail = DETAIL_ACTIONS.includes(action);
+        urlPath = '/' + prefix + '/' + (isDetail ? '<id>/' : '');
+      }}
+
+      // Fallback: try path('...') in context
+      if (!urlPath && spec.context) {{
         const ctxMatch = spec.context.match(/path\\s*\\(\\s*['"]([^'"]+)['"]/);
         if (ctxMatch) urlPath = '/' + ctxMatch[1];
       }}
-      const lines = ['curl -X ' + method + ' "https://your-api.server' + urlPath + '"'];
-      if (authInfo.header) lines.push('  -H "' + authInfo.header + '"');
+
+      if (!urlPath) urlPath = '/api/your-endpoint/';
+
+      const header = authInfo.header ? escHtml(authInfo.header) : null;
+      const lines = ['curl -X ' + method + ' "https://your-api.server' + escHtml(urlPath) + '"'];
+      if (header) lines.push('  -H "' + header + '"');
       lines.push('  -H "Content-Type: application/json"');
       if (spec.payload && spec.payload.length && !['GET', 'DELETE'].includes(method)) {{
         const body = {{}};
         spec.payload.forEach(f => {{ body[f] = ''; }});
-        const bodyStr = JSON.stringify(body, null, 2).split(NL).join(NL + '       ');
+        const bodyStr = escHtml(JSON.stringify(body, null, 2)).split(NL).join(NL + '       ');
         lines.push("  -d '" + bodyStr + "'");
       }}
       return lines.join(' \\\\' + NL);
@@ -1133,6 +1167,7 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
           </div>
           <div class="auth-badge" style="border-color:${{authInfo.color}}20; background:${{authInfo.color}}0d;">
             <span style="color:${{authInfo.color}}; font-weight:700;">${{authInfo.label}}</span>
+            ${{authInfo.key ? `<div style="margin-top:6px;"><span class="auth-pill" style="background:rgba(98,221,255,0.12);border-color:rgba(98,221,255,0.3);color:var(--primary);font-size:0.8rem;padding:4px 10px;">Permission key: <strong>${{authInfo.key}}</strong></span></div>` : ''}}
             ${{authInfo.header ? `<code class="auth-header">${{authInfo.header}}</code>` : ''}}
             ${{(spec.permission_classes||[]).length ? `<div class="auth-classes">${{(spec.permission_classes||[]).map(p=>`<span class="auth-pill">${{p}}</span>`).join('')}}</div>` : ''}}
           </div>
@@ -1140,7 +1175,7 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
 
         <div class="spec-section">
           <div class="spec-block-head">
-            <span class="spec-label payload-label">EXPECTED PAYLOAD</span>
+            <span class="spec-label payload-label">PAYLOAD</span>
             <button class="spec-copy-btn" onclick="copySpecBlock('payload-block', this)">Copy</button>
           </div>
           <div class="json-block" id="payload-block">${{syntaxHighlight(payloadJson)}}</div>
@@ -1359,6 +1394,7 @@ def render_api_row(api: dict[str, Any]) -> str:
         "db_ops": api.get("db_ops", []),
         "outbound_calls": api.get("outbound_calls", []),
         "serializer": api.get("serializer_class") or "",
+        "auth_decorator": api.get("auth_decorator") or "",
     }), quote=True)
 
     return f"""
