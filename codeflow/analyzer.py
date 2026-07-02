@@ -135,11 +135,15 @@ class ModelField:
     name: str
     type: str
     related_to: str | None = None
+    description: str = ""
+    is_relation: bool = False
+    relation_description: str | None = None
 
 @dataclass
 class ModelSchema:
     name: str
     file: str
+    description: str = ""
     fields: list[ModelField] = field(default_factory=list)
 
 @dataclass
@@ -1465,6 +1469,193 @@ def build_file_summary(
     return ", ".join(fragments) if fragments else "No major flow signals detected"
 
 
+_RELATION_FIELD_TYPES = frozenset({"ForeignKey", "OneToOneField", "ManyToManyField"})
+
+_FIELD_TYPE_MEANINGS = {
+    "CharField": "short text value",
+    "TextField": "long-form text",
+    "IntegerField": "integer number",
+    "BigIntegerField": "large (64-bit) integer",
+    "SmallIntegerField": "small integer",
+    "PositiveIntegerField": "non-negative integer",
+    "PositiveSmallIntegerField": "small non-negative integer",
+    "FloatField": "floating-point number",
+    "DecimalField": "fixed-precision decimal number",
+    "BooleanField": "true/false flag",
+    "NullBooleanField": "true/false/null flag",
+    "DateField": "calendar date",
+    "DateTimeField": "date and time",
+    "TimeField": "time of day",
+    "DurationField": "time duration",
+    "EmailField": "email address",
+    "URLField": "URL",
+    "UUIDField": "universally unique identifier (UUID)",
+    "SlugField": "URL-friendly slug",
+    "IPAddressField": "IP address",
+    "GenericIPAddressField": "IP address",
+    "FileField": "uploaded file reference",
+    "ImageField": "uploaded image reference",
+    "FilePathField": "filesystem path",
+    "BinaryField": "raw binary data",
+    "JSONField": "structured JSON data",
+    "AutoField": "auto-incrementing primary key",
+    "BigAutoField": "auto-incrementing primary key (64-bit)",
+}
+
+def _humanize_identifier(name: str) -> str:
+    """user_profile / UserProfile -> 'user profile'."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name.replace("_", " "))
+    return re.sub(r"\s+", " ", spaced).strip().lower()
+
+
+def _extract_field_options(call: ast.Call) -> dict[str, Any]:
+    """Pull keyword arguments off a model-field constructor call."""
+    opts: dict[str, Any] = {}
+    for kw in call.keywords:
+        if kw.arg is None:
+            continue
+        val = kw.value
+        if isinstance(val, ast.Constant):
+            opts[kw.arg] = val.value
+        elif isinstance(val, ast.Attribute):
+            opts[kw.arg] = val.attr  # models.CASCADE -> "CASCADE"
+        elif isinstance(val, ast.Name):
+            opts[kw.arg] = val.id
+        else:
+            opts[kw.arg] = "computed"
+    return opts
+
+
+def _field_constraint_notes(opts: dict[str, Any]) -> list[str]:
+    notes = []
+    if opts.get("primary_key") is True:
+        notes.append("primary key")
+    if opts.get("unique") is True:
+        notes.append("unique")
+    if opts.get("null") is True:
+        notes.append("nullable")
+    if opts.get("blank") is True:
+        notes.append("optional")
+    if isinstance(opts.get("max_length"), int):
+        notes.append(f"max {opts['max_length']} chars")
+    if opts.get("auto_now_add") is True:
+        notes.append("auto-set on create")
+    if opts.get("auto_now") is True:
+        notes.append("auto-updated on save")
+    if "choices" in opts:
+        notes.append("restricted to predefined choices")
+    if "default" in opts:
+        default = opts["default"]
+        notes.append("has computed default" if default == "computed" else f"default: {default!r}")
+    return notes
+
+
+def _describe_plain_field(name: str, ftype: str, opts: dict[str, Any]) -> str:
+    lowered = name.lower()
+    type_meaning = _FIELD_TYPE_MEANINGS.get(ftype, f"{ftype} value")
+
+    if lowered in ("id", "pk"):
+        base = "Primary key uniquely identifying each row"
+    elif lowered in ("created_at", "created_on", "date_created", "creation_date", "created"):
+        base = "Timestamp recording when the row was created"
+    elif lowered in ("updated_at", "modified_at", "date_modified", "last_updated", "updated"):
+        base = "Timestamp recording when the row was last updated"
+    elif lowered in ("deleted_at", "date_deleted"):
+        base = "Timestamp recording when the row was soft-deleted"
+    elif lowered.startswith(("is_", "has_", "can_", "should_", "allow_")):
+        base = f"Flag indicating whether the record {_humanize_identifier(name)}"
+    elif lowered.endswith(("_at", "_on")) and ftype in ("DateTimeField", "DateField"):
+        base = f"Timestamp for {_humanize_identifier(name[: name.rfind('_')])}"
+    elif lowered.endswith("_count"):
+        base = f"Count of {_humanize_identifier(name[:-6])}"
+    else:
+        base = f"Stores the {_humanize_identifier(name)} ({type_meaning})"
+
+    notes = _field_constraint_notes(opts)
+    if notes:
+        base += f" — {', '.join(notes)}"
+    return base + "."
+
+
+_AUDIT_CREATED = frozenset({"created_by", "createdby", "added_by", "addedby", "creator", "author", "submitted_by", "uploaded_by", "raised_by", "requested_by"})
+_AUDIT_MODIFIED = frozenset({"modified_by", "modifiedby", "updated_by", "updatedby", "last_modified_by", "last_updated_by", "edited_by", "changed_by"})
+_AUDIT_APPROVED = frozenset({"approved_by", "approvedby", "verified_by", "reviewed_by", "authorized_by", "signed_off_by"})
+_AUDIT_DELETED = frozenset({"deleted_by", "deletedby", "removed_by", "cancelled_by", "rejected_by"})
+_ASSIGNMENT = frozenset({"assigned_to", "assignee", "handled_by", "processed_by", "managed_by", "resolved_by"})
+_OWNERSHIP = frozenset({"owner", "user", "customer", "account", "client", "member", "profile", "merchant", "vendor", "agent", "dealer", "retailer"})
+_CLASSIFICATION = frozenset({"status", "state", "category", "type", "plan", "tier", "level", "grade", "brand", "variant"})
+
+
+def _relation_purpose(field_name: str, ftype: str, container: str, target: str) -> str:
+    lowered = field_name.lower()
+    if lowered.endswith("_id"):
+        lowered = lowered[:-3]
+    container_h = _humanize_identifier(container)
+
+    if lowered in _AUDIT_CREATED:
+        return f"Audit field — records which {target} created this {container_h} row"
+    if lowered in _AUDIT_MODIFIED:
+        return f"Audit field — records which {target} last modified this {container_h} row"
+    if lowered in _AUDIT_APPROVED:
+        return f"Audit field — records which {target} approved/verified this {container_h} row"
+    if lowered in _AUDIT_DELETED:
+        return f"Audit field — records which {target} deleted/cancelled this {container_h} row"
+    if lowered in _ASSIGNMENT:
+        return f"Assignment — the {target} responsible for handling this {container_h} row"
+    if lowered == "parent" or target == container:
+        return f"Hierarchy link — points to the parent {target}, letting {container_h} rows form a tree"
+    if ftype == "OneToOneField":
+        if lowered in _OWNERSHIP:
+            return f"Ownership link — each {container_h} belongs to exactly one {target}, and each {target} has at most one {container_h}"
+        return f"Extension link — each {container_h} has exactly one dedicated {target} record (and vice versa)"
+    if ftype == "ManyToManyField":
+        return f"Association — a {container_h} can be linked to many {target} records, and a {target} to many {container_h} rows"
+    if lowered in _OWNERSHIP:
+        return f"Ownership link — ties this {container_h} to the {target} it belongs to; one {target} can own many {container_h} rows"
+    if lowered in _CLASSIFICATION:
+        return f"Classification — labels this {container_h} with a shared {target} value"
+    return f"Belongs-to link — every {container_h} row is attached to one {target}; one {target} can group many {container_h} rows"
+
+
+def _describe_relation_field(container: str, field_name: str, ftype: str, related_to: str | None, opts: dict[str, Any]) -> str:
+    target = (related_to or "another model").split(".")[-1]
+    if target == "self":
+        target = container
+    container_h = _humanize_identifier(container)
+    base = _relation_purpose(field_name, ftype, container, target)
+
+    on_delete_phrases = {
+        "CASCADE": f"deleting a {target} also deletes its {container_h} rows",
+        "PROTECT": f"a {target} cannot be deleted while {container_h} rows still point to it",
+        "RESTRICT": f"the database blocks deleting a {target} that is still referenced",
+        "SET_NULL": f"if the {target} is deleted, this column becomes NULL",
+        "SET_DEFAULT": f"if the {target} is deleted, this column falls back to its default",
+        "DO_NOTHING": f"nothing happens automatically when the {target} is deleted",
+    }
+    on_delete = opts.get("on_delete")
+    if on_delete in on_delete_phrases:
+        base += f". Delete rule: {on_delete_phrases[on_delete]}"
+    related_name = opts.get("related_name")
+    if isinstance(related_name, str) and related_name != "computed":
+        base += f". Reverse lookup from {target}: '{related_name}'"
+    return base + "."
+
+
+def _describe_model(node: ast.ClassDef, fields: list[ModelField]) -> str:
+    docstring = ast.get_docstring(node)
+    if docstring:
+        return docstring.strip().splitlines()[0].strip()
+
+    desc = f"Stores {_humanize_identifier(node.name)} records ({len(fields)} column{'s' if len(fields) != 1 else ''}"
+    linked = sorted({
+        node.name if f.related_to == "self" else f.related_to
+        for f in fields if f.is_relation and f.related_to
+    })
+    if linked:
+        desc += f"; linked to {', '.join(linked)}"
+    return desc + ")."
+
+
 def analyze_django_models(path: Path, content: str) -> list[ModelSchema]:
     try:
         with warnings.catch_warnings():
@@ -1472,7 +1663,7 @@ def analyze_django_models(path: Path, content: str) -> list[ModelSchema]:
             tree = ast.parse(content)
     except SyntaxError:
         return []
-    
+
     models = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
@@ -1484,33 +1675,70 @@ def analyze_django_models(path: Path, content: str) -> list[ModelSchema]:
             )
             if not is_model:
                 continue
-                
+
             fields = []
             for item in node.body:
                 if isinstance(item, ast.Assign) and len(item.targets) == 1:
                     target = item.targets[0]
                     if isinstance(target, ast.Name):
+                        # Only constructor calls are database columns; skip class
+                        # constants like PAYMENT_MODE_CHOICES = (...)
+                        if not isinstance(item.value, ast.Call):
+                            continue
+
                         field_name = target.id
                         field_type = "Unknown"
                         related_to = None
-                        
-                        if isinstance(item.value, ast.Call):
-                            func = item.value.func
-                            if isinstance(func, ast.Attribute):
-                                field_type = func.attr
-                            elif isinstance(func, ast.Name):
-                                field_type = func.id
-                                
-                            # Extract relationships
-                            for arg in item.value.args:
-                                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                                    related_to = arg.value
-                                elif isinstance(arg, ast.Name):
-                                    related_to = arg.id
-                                    
-                        fields.append(ModelField(name=field_name, type=field_type, related_to=related_to))
-            
-            models.append(ModelSchema(name=node.name, file=str(path), fields=fields))
+
+                        func = item.value.func
+                        if isinstance(func, ast.Attribute):
+                            field_type = func.attr
+                        elif isinstance(func, ast.Name):
+                            field_type = func.id
+
+                        # Extract relationships
+                        for arg in item.value.args:
+                            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                                related_to = arg.value
+                            elif isinstance(arg, ast.Name):
+                                related_to = arg.id
+
+                        opts = _extract_field_options(item.value)
+                        if related_to is None and isinstance(opts.get("to"), str):
+                            related_to = opts["to"]
+
+                        is_relation = field_type in _RELATION_FIELD_TYPES
+                        help_text = opts.get("help_text")
+                        verbose_name = opts.get("verbose_name")
+                        relation_description = (
+                            _describe_relation_field(node.name, field_name, field_type, related_to, opts)
+                            if is_relation else None
+                        )
+
+                        if isinstance(help_text, str) and help_text.strip():
+                            description = help_text.strip()
+                        elif isinstance(verbose_name, str) and verbose_name.strip():
+                            description = f"{verbose_name.strip().capitalize()} ({_FIELD_TYPE_MEANINGS.get(field_type, field_type)})."
+                        elif is_relation:
+                            description = relation_description or ""
+                        else:
+                            description = _describe_plain_field(field_name, field_type, opts)
+
+                        fields.append(ModelField(
+                            name=field_name,
+                            type=field_type,
+                            related_to=related_to,
+                            description=description,
+                            is_relation=is_relation,
+                            relation_description=relation_description,
+                        ))
+
+            models.append(ModelSchema(
+                name=node.name,
+                file=str(path),
+                description=_describe_model(node, fields),
+                fields=fields,
+            ))
     return models
 
 

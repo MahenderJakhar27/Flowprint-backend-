@@ -15,7 +15,7 @@ from codeflow.analyzer import analyze_paths, generate_mermaid
 
 
 HOST = "127.0.0.1"
-PORT = 8012
+PORT = 8000
 
 
 def render_page(report: dict[str, Any] | None = None, error: str | None = None) -> str:
@@ -168,9 +168,9 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
           <section class="card">
             <div class="section-head">
                <h2>Model Schema</h2>
-               <p>Detailed field definitions and relationships extracted from your models.py files.</p>
+               <p>Every table and column with descriptions — foreign keys include their relationship and delete behavior.</p>
             </div>
-            <div class="panel-grid">
+            <div class="schema-stack">
                {"".join(render_model_schema_card(m) for m in report.get("schema", []))}
             </div>
           </section>
@@ -371,6 +371,43 @@ def render_page(report: dict[str, Any] | None = None, error: str | None = None) 
     .config-table th:nth-child(1), .config-table td:nth-child(1) {{ width: 36%; }}
     .config-table th:nth-child(2), .config-table td:nth-child(2) {{ width: 42%; }}
     .config-table th:nth-child(3), .config-table td:nth-child(3) {{ width: 22%; color: var(--muted); }}
+    /* Schema detail tables */
+    .schema-stack {{
+       display: grid;
+       gap: 18px;
+    }}
+    .schema-table th:nth-child(1), .schema-table td:nth-child(1) {{ width: 20%; }}
+    .schema-table th:nth-child(2), .schema-table td:nth-child(2) {{ width: 22%; }}
+    .schema-table th:nth-child(3), .schema-table td:nth-child(3) {{ width: 58%; }}
+    .schema-table td {{
+       white-space: normal;
+       word-break: break-word;
+       vertical-align: top;
+    }}
+    .schema-desc {{
+       color: var(--muted);
+       font-size: 0.9rem;
+       margin-top: 6px;
+    }}
+    .fk-badge {{
+       display: inline-block;
+       margin-left: 6px;
+       padding: 2px 8px;
+       border-radius: 999px;
+       font-size: 0.7rem;
+       font-weight: 600;
+       letter-spacing: 0.04em;
+       background: rgba(255, 184, 108, 0.14);
+       border: 1px solid rgba(255, 184, 108, 0.45);
+       color: #ffb86c;
+       white-space: nowrap;
+    }}
+    .fk-note {{
+       margin-top: 4px;
+       font-size: 0.82rem;
+       color: #ffb86c;
+       opacity: 0.85;
+    }}
     .table-wrap {{
        overflow-x: auto;
        border-radius: 16px;
@@ -1415,19 +1452,43 @@ def render_db_card(db: dict[str, Any]) -> str:
     </div>
     """
 
+_RELATION_BADGES = {"ForeignKey": "FK", "OneToOneField": "1:1", "ManyToManyField": "M:N"}
+
+
 def render_model_schema_card(model: dict[str, Any]) -> str:
-    fields_html = "".join(
-        f"<li><strong>{html.escape(f['name'])}</strong>: <span style='color:var(--primary);'>{html.escape(f['type'])}</span>"
-        f"{f' &rarr; {html.escape(f['related_to'])}' if f['related_to'] else ''}</li>"
-        for f in model["fields"]
-    )
+    rows = []
+    for f in model["fields"]:
+        type_html = f"<span style='color:var(--primary);'>{html.escape(f['type'])}</span>"
+        if f.get("is_relation") and f.get("related_to"):
+            badge = _RELATION_BADGES.get(f["type"], "FK")
+            type_html += f"<span class='fk-badge'>{badge} &rarr; {html.escape(f['related_to'])}</span>"
+
+        desc_html = html.escape(f.get("description") or "") or "<em>No description detected.</em>"
+        relation_desc = f.get("relation_description")
+        if relation_desc and relation_desc != f.get("description"):
+            desc_html += f"<div class='fk-note'>{html.escape(relation_desc)}</div>"
+
+        rows.append(
+            f"<tr><td><strong>{html.escape(f['name'])}</strong></td>"
+            f"<td>{type_html}</td>"
+            f"<td>{desc_html}</td></tr>"
+        )
+
+    table_html = f"""
+      <div class="table-wrap">
+        <table class="api-table schema-table">
+          <thead><tr><th>Column</th><th>Type</th><th>Description</th></tr></thead>
+          <tbody>{"".join(rows)}</tbody>
+        </table>
+      </div>
+    """ if rows else "<p class='schema-desc'>No fields detected.</p>"
+
     return f"""
     <div class="soft-panel">
       <h4>{html.escape(model["name"])}</h4>
       <p><small>{html.escape(shorten_path(model["file"]))}</small></p>
-      <ul class="simple-list" style="margin-top:10px; font-size:0.85rem;">
-        {fields_html or "<li>No fields detected.</li>"}
-      </ul>
+      <p class="schema-desc">{html.escape(model.get("description") or "")}</p>
+      {table_html}
     </div>
     """
 
